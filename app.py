@@ -89,7 +89,7 @@ DATA_FILE = os.environ.get("DATA_FILE", "signals.json")
 MAX_HISTORY = 500
 MAX_CHATTER = 160
 
-CYCLE_MINUTES = float(os.environ.get("CYCLE_MINUTES", "30"))
+CYCLE_MINUTES = float(os.environ.get("CYCLE_MINUTES", "5"))
 BOOT_DELAY_SECONDS = int(os.environ.get("BOOT_DELAY_SECONDS", "30"))
 
 BINANCE_BASES = ["https://api.binance.com", "https://api1.binance.com", "https://data-api.binance.vision"]
@@ -958,8 +958,13 @@ function render(d){
   const age = d.last_cycle_ts ? Math.round((Date.now()/1000 - d.last_cycle_ts)) : null;
   live.textContent = d.data_feed_ok ? (age != null ? `desk live · last sweep ${age}s ago` : 'desk live') : 'feed issues';
 
-  document.getElementById('banner').innerHTML = d.data_feed_ok ? '' :
-    `<div class="banner"><b>⚠ Data feed problem:</b> some symbols could not be fetched from Binance. ${d.last_error||''}</div>`;
+  const staleMin = age != null ? age / 60 : null;
+  const staleWarn = staleMin != null && staleMin > Math.max(d.cycle_minutes * 1.5, 10);
+  document.getElementById('banner').innerHTML = !d.data_feed_ok
+    ? `<div class="banner"><b>⚠ Data feed problem:</b> some symbols could not be fetched. ${d.last_error||''}</div>`
+    : staleWarn
+      ? `<div class="banner"><b>⚠ Reads are ${Math.round(staleMin)} min old</b> — desk was likely asleep (Render free tier). Hit "Run sweep" or set up a keep-alive pinger on /health for live data.</div>`
+      : '';
 
   // stats
   const st = d.stats || {};
