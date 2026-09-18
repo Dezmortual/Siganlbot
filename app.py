@@ -492,6 +492,8 @@ def crew_review(read):
             lines.append(_say("michael", M["line"], read["symbol"]))
         if F["verdict"] == "VETO" and F["line"]:
             lines.append(_say("franklin", F["line"], read["symbol"]))
+        elif F["verdict"] == "APPROVE" and sig is not None and F["line"]:
+            lines.append(_say("franklin", F["line"], read["symbol"]))
         if T["verdict"] == "EXECUTE" and T["line"]:
             lines.append(_say("trevor", T["line"], read["symbol"]))
 
