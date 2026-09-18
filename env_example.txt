@@ -2,6 +2,8 @@
 
 # Comma-separated coins to scan (vs USDT on Binance spot)
 WATCHLIST=BTC,ETH,SOL,BNB,XRP,DOGE,ADA,LINK,AVAX,TON
+# FX + gold (Yahoo Finance tickers). "" disables.
+FOREX_GOLD=EURUSD=X,GBPUSD=X,USDJPY=X,AUDUSD=X,GC=F
 
 # Minutes between crew sweeps
 CYCLE_MINUTES=30
@@ -18,3 +20,10 @@ MAX_ATR_PCT=6.0
 
 # Minutes before the same symbol+direction may signal again
 RESCAN_MINUTES=60
+
+# Lester: min 1h ADX for a trend to count (20 = standard, 25 = stricter)
+ADX_MIN=20
+# Franklin: max distance from EMA20 in ATRs before he calls it chasing
+MAX_EXT_ATR=2.5
+# Franklin: veto FX/gold entries in the rollover hour (1 = on)
+FX_ROLLOVER_VETO=1

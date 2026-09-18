@@ -80,6 +80,11 @@ MO_FLOOR = float(os.environ.get("MO_FLOOR", "50"))
 
 # Franklin's risk rails
 MAX_ATR_PCT = float(os.environ.get("MAX_ATR_PCT", "6.0"))  # ATR/price ceiling
+MAX_EXT_ATR = float(os.environ.get("MAX_EXT_ATR", "2.5"))  # max distance from EMA20, in ATRs (chase filter)
+FX_ROLLOVER_VETO = os.environ.get("FX_ROLLOVER_VETO", "1") == "1"  # skip FX/gold in the thin rollover hour
+
+# Lester's trend-strength rails
+ADX_MIN = float(os.environ.get("ADX_MIN", "20"))  # 1h ADX must clear this for a trend to count
 
 ATR_MULT = 1.5
 TP1_R, TP2_R, TP3_R = 1.0, 2.0, 3.0
@@ -200,6 +205,8 @@ def fetch_price(symbol):
 # --- Yahoo Finance feed (forex + gold), same hard-bounded pattern ---
 
 UA_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+FX_SYMBOLS = set(disp(t) for t in FOREX_GOLD)
+
 YAHOO_BASES = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
 YAHOO_INTERVAL = {"15m": ("15m", "1mo"), "1h": ("60m", "3mo"), "1d": ("1d", "1y")}
 FX_STALE_SECONDS = 3 * 3600  # last 15m bar older than this -> market closed
@@ -320,6 +327,65 @@ def rsi(closes, period=14):
     rs = avg_g / avg_l
     return 100.0 - (100.0 / (1.0 + rs))
 
+def adx(candles, period=14):
+    """Wilder ADX + DI direction. Returns (adx_value, di_dir) or (None, None)."""
+    if len(candles) < period * 2 + 2:
+        return None, None
+    trs, pdms, mdms = [], [], []
+    for i in range(1, len(candles)):
+        h, l, pc = candles[i][1], candles[i][2], candles[i - 1][3]
+        up = h - candles[i - 1][1]
+        dn = candles[i - 1][2] - l
+        pdms.append(up if (up > dn and up > 0) else 0.0)
+        mdms.append(dn if (dn > up and dn > 0) else 0.0)
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    n = period
+    atr_ = sum(trs[:n]) / n
+    pd = sum(pdms[:n]) / n
+    md = sum(mdms[:n]) / n
+    dxs, pdi, mdi = [], 0.0, 0.0
+    for i in range(n, len(trs)):
+        atr_ = (atr_ * (n - 1) + trs[i]) / n
+        pd = (pd * (n - 1) + pdms[i]) / n
+        md = (md * (n - 1) + mdms[i]) / n
+        if atr_ <= 0:
+            continue
+        pdi, mdi = 100.0 * pd / atr_, 100.0 * md / atr_
+        s = pdi + mdi
+        dxs.append(100.0 * abs(pdi - mdi) / s if s else 0.0)
+    if len(dxs) < n or not dxs:
+        return None, None
+    val = sum(dxs[-n:]) / n
+    return val, (1 if pdi >= mdi else -1)
+
+def _ema_series(values, period):
+    out = []
+    if len(values) < period:
+        return out
+    k = 2.0 / (period + 1)
+    e = sum(values[:period]) / period
+    out.append(e)
+    for v in values[period:]:
+        e = v * k + e * (1 - k)
+        out.append(e)
+    return out
+
+def macd_read(closes, fast=12, slow=26, sig_p=9):
+    """Returns {'hist': latest, 'slope': hist[-1]-hist[-2]} or None."""
+    if len(closes) < slow + sig_p + 2:
+        return None
+    ef = _ema_series(closes, fast)
+    es = _ema_series(closes, slow)
+    m = len(es)
+    line = [ef[-i] - es[-i] for i in range(1, m + 1)][::-1]
+    if len(line) < sig_p + 2:
+        return None
+    sig_line = _ema_series(line, sig_p)
+    if len(sig_line) < 2:
+        return None
+    hist = [line[len(line) - len(sig_line) + i] - sig_line[i] for i in range(len(sig_line))]
+    return {"hist": hist[-1], "slope": hist[-1] - hist[-2]}
+
 def atr(candles, period=14):
     if len(candles) < period + 1:
         return None
@@ -362,10 +428,8 @@ def timeframe_vote(candles):
         if r < RSI_OVERSOLD:
             return 0, detail
         return -1, detail
-    if r < RSI_OVERSOLD:
-        return +1, detail
-    if r > RSI_OVERBOUGHT:
-        return -1, detail
+    # No clean EMA stack -> no edge. Never vote counter-trend off RSI alone:
+    # that's how the desk used to fire LONGs into falling markets.
     return 0, detail
 
 def base_read(symbol, klines):
@@ -384,6 +448,12 @@ def base_read(symbol, klines):
     d1h = details.get("1h", {})
     vol_ok = sum(1 for d in details.values() if d.get("vol_ok")) >= 2
 
+    adx_v, di_dir = adx(ref)
+    closes_1h = [c[3] for c in ref]
+    mac = macd_read(closes_1h)
+    e20_1h = ema(closes_1h, 20)
+    ext = (abs(last_close - e20_1h) / a) if (a and e20_1h and last_close) else None
+
     return {
         "symbol": symbol,
         "votes": votes,
@@ -395,6 +465,11 @@ def base_read(symbol, klines):
         "atr_pct": (a / last_close * 100.0) if (a and last_close) else None,
         "last_close": last_close,
         "vol_ok": vol_ok,
+        "adx_1h": adx_v,
+        "di_dir_1h": di_dir,
+        "macd_1h": mac,
+        "ext_atr": ext,
+        "is_fx_gold": symbol in FX_SYMBOLS,
         "ts": time.time(),
     }
 
@@ -403,17 +478,28 @@ def base_read(symbol, klines):
 # ----------------------------------------------------------------------------
 
 def lester(read):
-    """Head Analyst: structure across timeframes."""
+    """Head Analyst: structure across timeframes, strength-filtered (1h ADX)."""
     bull, bear = read["bull"], read["bear"]
     votes = read["votes"]
+    adx_v, di_dir = read.get("adx_1h"), read.get("di_dir_1h")
     if bull >= MIN_CONFLUENCE and bull > bear:
         hold = [tf for tf, v in votes.items() if v <= 0]
         extra = f" ({hold[0]} is the holdout)" if hold else " — unanimous"
-        return {"verdict": "LONG", "line": f"{read['symbol']} structure is clean: {bull}/4 timeframes trending up{extra}."}
+        if adx_v is not None and di_dir is not None:
+            if adx_v < ADX_MIN:
+                return {"verdict": "NEUTRAL", "line": f"{read['symbol']} has {bull}/4 up but ADX {round(adx_v,1)} — that's chop, not a trend. Pass."}
+            if di_dir < 0:
+                return {"verdict": "NEUTRAL", "line": f"{read['symbol']} stacks up but sellers own the 1h (-DI leads, ADX {round(adx_v,1)}). No clean structure."}
+        return {"verdict": "LONG", "line": f"{read['symbol']} structure is clean: {bull}/4 timeframes trending up, ADX {round(adx_v,1) if adx_v else '--'}{extra}."}
     if bear >= MIN_CONFLUENCE and bear > bull:
         hold = [tf for tf, v in votes.items() if v >= 0]
         extra = f" ({hold[0]} is the holdout)" if hold else " — unanimous"
-        return {"verdict": "SHORT", "line": f"{read['symbol']} structure is heavy: {bear}/4 timeframes trending down{extra}."}
+        if adx_v is not None and di_dir is not None:
+            if adx_v < ADX_MIN:
+                return {"verdict": "NEUTRAL", "line": f"{read['symbol']} has {bear}/4 down but ADX {round(adx_v,1)} — that's chop, not a trend. Pass."}
+            if di_dir > 0:
+                return {"verdict": "NEUTRAL", "line": f"{read['symbol']} stacks down but buyers own the 1h (+DI leads, ADX {round(adx_v,1)}). No clean structure."}
+        return {"verdict": "SHORT", "line": f"{read['symbol']} structure is heavy: {bear}/4 timeframes trending down, ADX {round(adx_v,1) if adx_v else '--'}{extra}."}
     if max(bull, bear) == 2:
         return {"verdict": "NEUTRAL", "line": f"{read['symbol']}: {bull} up / {bear} down. Structure is forming, no edge yet."}
     return {"verdict": "NEUTRAL", "line": f"{read['symbol']}: timeframes disagree, staying off it."}
@@ -428,12 +514,21 @@ def michael(read):
         return {"verdict": "NEUTRAL", "line": f"{read['symbol']} is running hot at RSI {rc} — I don't chase blow-off tops."}
     if rc < RSI_OVERSOLD:
         return {"verdict": "NEUTRAL", "line": f"{read['symbol']} is washed out at RSI {rc} — not catching knives, waiting for a base."}
+    mac = read.get("macd_1h")
     if read["bull"] >= MIN_CONFLUENCE:
         if rc >= MO_FLOOR:
+            if mac and mac["hist"] is not None:
+                if mac["hist"] > 0 and mac["slope"] > 0:
+                    return {"verdict": "LONG", "line": f"Momentum's live on {read['symbol']} — RSI {rc}, MACD building. Room before it's cooked."}
+                return {"verdict": "NEUTRAL", "line": f"{read['symbol']} RSI {rc} but MACD isn't confirming the fuel. Wait."}
             return {"verdict": "LONG", "line": f"Momentum's live on {read['symbol']} — RSI {rc}, room before it's cooked."}
         return {"verdict": "NEUTRAL", "line": f"{read['symbol']} momentum's flat (RSI {rc}). Wait for fuel."}
     if read["bear"] >= MIN_CONFLUENCE:
         if rc <= (100 - MO_FLOOR):
+            if mac and mac["hist"] is not None:
+                if mac["hist"] < 0 and mac["slope"] < 0:
+                    return {"verdict": "SHORT", "line": f"{read['symbol']} is rolling over — RSI {rc}, MACD fading. Downside has room."}
+                return {"verdict": "NEUTRAL", "line": f"{read['symbol']} RSI {rc} but MACD hasn't turned over yet. Wait."}
             return {"verdict": "SHORT", "line": f"{read['symbol']} is rolling over — RSI {rc}, downside has room."}
         return {"verdict": "NEUTRAL", "line": f"{read['symbol']} still too perky to short (RSI {rc})."}
     return {"verdict": "NEUTRAL", "line": f"{read['symbol']}: momentum fine but no setup to confirm."}
@@ -452,6 +547,15 @@ def franklin(read, direction):
         return {"verdict": "VETO", "line": f"VETO on {read['symbol']} long: RSI {round(r,1)} is stretched to the moon."}
     if direction == "SHORT" and r is not None and r < RSI_OVERSOLD:
         return {"verdict": "VETO", "line": f"VETO on {read['symbol']} short: RSI {round(r,1)} — knife-catch territory."}
+    # FX/gold: skip the thin rollover hour (wide spreads, fake outs)
+    if FX_ROLLOVER_VETO and read.get("is_fx_gold"):
+        now_utc = datetime.now(timezone.utc)
+        if (now_utc.hour == 21 and now_utc.minute >= 45) or (now_utc.hour == 22 and now_utc.minute < 15):
+            return {"verdict": "VETO", "line": f"VETO on {read['symbol']}: we're in the rollover hour — spreads widen and moves lie. Wait it out."}
+    # Don't chase: price too far from the 20 EMA means the move is already stretched
+    ext = read.get("ext_atr")
+    if ext is not None and ext > MAX_EXT_ATR:
+        return {"verdict": "VETO", "line": f"VETO on {read['symbol']} {direction.lower()}: price is {ext:.1f} ATR off the 20 EMA — that's chasing, not entering. Wait for the pullback."}
     sl_pct = ATR_MULT * pct if pct is not None else None
     note = f"risk is {sl_pct:.1f}% to the stop" if sl_pct else "risk sized to 1.5x ATR"
     return {"verdict": "APPROVE", "line": f"{read['symbol']} {direction} clears risk: {note}. Green light from me."}
@@ -523,6 +627,15 @@ def build_signal(read, direction):
         tps = [entry - TP1_R * risk, entry - TP2_R * risk, entry - TP3_R * risk]
 
     conf = int(round(100.0 * max(read["bull"], read["bear"]) / len(TIMEFRAMES)))
+    adx_v = read.get("adx_1h")
+    if adx_v is not None and adx_v >= 30:
+        conf = min(95, conf + 10)
+    elif adx_v is not None and adx_v >= 25:
+        conf = min(95, conf + 5)
+    mac = read.get("macd_1h")
+    if mac and mac["hist"] is not None and (
+        (direction == "LONG" and mac["hist"] > 0) or (direction == "SHORT" and mac["hist"] < 0)):
+        conf = min(95, conf + 5)
     return {
         "id": f"{read['symbol']}-{int(time.time())}",
         "symbol": read["symbol"],
