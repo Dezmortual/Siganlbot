@@ -840,7 +840,7 @@ function render(d){
   // stats
   const st = d.stats || {};
   document.getElementById('s-win').textContent = st.win_rate == null ? '--' : st.win_rate + '%';
-  document.getElementById('s-win-n').textContent = st.win_rate == null ? 'no closed signals yet' : `${st.sl_rate ?? '--}% hit the stop`;
+  document.getElementById('s-win-n').textContent = st.win_rate == null ? 'no closed signals yet' : `${st.sl_rate ?? '--'}% hit the stop`;
   document.getElementById('s-closed').textContent = st.closed ?? 0;
   document.getElementById('s-avg').textContent = st.avg_r == null ? '--' : st.avg_r + 'R';
   const opens = d.open_signals.length;
