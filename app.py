@@ -49,6 +49,25 @@ WATCHLIST = [
 
 QUOTE = "USDT"
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
+
+# FX + gold via Yahoo Finance chart API (Binance has no forex/gold).
+# Yahoo ticker format. Set FOREX_GOLD="" to disable. GC=F = COMEX gold futures.
+FOREX_GOLD = [
+    c.strip().upper()
+    for c in os.environ.get(
+        "FOREX_GOLD", "EURUSD=X,GBPUSD=X,USDJPY=X,AUDUSD=X,GC=F"
+    ).split(",")
+    if c.strip()
+]
+
+def is_fx(sym):
+    return "=" in sym or ":" in sym
+
+def disp(sym):
+    """Display name: EURUSD=X -> EURUSD, GC=F -> GOLD, BTC -> BTCUSDT."""
+    if sym == "GC=F":
+        return "GOLD"
+    return sym.replace("=X", "").replace("=F", "")
 CANDLE_LIMIT = 220
 MIN_CONFLUENCE = int(os.environ.get("MIN_CONFLUENCE", "3"))
 
@@ -177,6 +196,97 @@ def fetch_price(symbol):
         except Exception:
             return None
     return None
+
+# --- Yahoo Finance feed (forex + gold), same hard-bounded pattern ---
+
+UA_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+YAHOO_BASES = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
+YAHOO_INTERVAL = {"15m": ("15m", "1mo"), "1h": ("60m", "3mo"), "1d": ("1d", "1y")}
+FX_STALE_SECONDS = 3 * 3600  # last 15m bar older than this -> market closed
+
+def _yahoo_chart(symbol, interval, rng):
+    def _do(base):
+        try:
+            r = requests.get(
+                base + "/v8/finance/chart/" + symbol,
+                params={"interval": interval, "range": rng},
+                headers=UA_HEADERS, timeout=FETCH_TIMEOUT,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            return None
+
+    def _run():
+        for base in YAHOO_BASES:
+            res = _do(base)
+            if res is not None:
+                return res
+        return None
+
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(_run)
+        try:
+            return fut.result(timeout=FETCH_HARD_BOUND)
+        except Exception:
+            return None
+
+def _yahoo_candles(payload):
+    """-> (list of [t,o,h,l,c,v], regularMarketPrice) or (None, None)."""
+    try:
+        res = payload["chart"]["result"][0]
+        ts = res.get("timestamp") or []
+        q = res["indicators"]["quote"][0]
+        vols = q.get("volume") or [0] * len(ts)
+        out = []
+        for i, t in enumerate(ts):
+            o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
+            if None in (o, h, l, c):
+                continue
+            out.append([t, o, h, l, c, float(vols[i] or 0)])
+        if not out:
+            return None, None
+        return out, res.get("meta", {}).get("regularMarketPrice")
+    except Exception:
+        return None, None
+
+def _resample_4h(candles):
+    """1h bars [t,o,h,l,c,v] -> 4h bars [o,h,l,c,v], aligned on 4h boundaries."""
+    groups, order = {}, []
+    for t, o, h, l, c, v in candles:
+        key = t // (4 * 3600)
+        if key not in groups:
+            groups[key] = [o, h, l, c, v]
+            order.append(key)
+        else:
+            g = groups[key]
+            g[1] = max(g[1], h)
+            g[2] = min(g[2], l)
+            g[3] = c
+            g[4] += v
+    return [groups[k] for k in order]
+
+def fetch_yahoo(symbol):
+    """-> (status, klines|None, price|None). status: OK / STALE (market closed) / ERROR."""
+    out, price, full_1h = {}, None, None
+    for tf in TIMEFRAMES:
+        if tf == "4h":
+            continue
+        interval, rng = YAHOO_INTERVAL[tf]
+        raw, px = _yahoo_candles(_yahoo_chart(symbol, interval, rng))
+        if not raw:
+            return "ERROR", None, None
+        if px:
+            price = float(px)
+        if tf == "15m" and raw[-1][0] + FX_STALE_SECONDS < time.time():
+            return "STALE", None, price
+        if tf == "1h":
+            full_1h = raw
+        out[tf] = [[o, h, l, c, v] for t, o, h, l, c, v in raw][-CANDLE_LIMIT:]
+    if not full_1h:
+        return "ERROR", None, None
+    out["4h"] = _resample_4h(full_1h)[-CANDLE_LIMIT:]
+    return "OK", out, price
 
 # ----------------------------------------------------------------------------
 # INDICATORS
@@ -498,17 +608,29 @@ def run_cycle():
 
     chatter.append(_say("lester", "Fresh sweep across the watchlist. Let's see what the market's giving us today."))
 
-    for coin in WATCHLIST:
-        symbol = f"{coin}{QUOTE}"
-        price = fetch_price(symbol)
-        if price:
-            prices[symbol] = price
-        klines = fetch_klines(symbol)
-        if not klines:
-            feed_ok = False
-            scan[symbol] = {"symbol": symbol, "direction": "NO_DATA", "confluence": "-",
-                            "score": 0, "rsi_1h": None, "last_close": price, "ts": time.time()}
-            continue
+    for coin in WATCHLIST + FOREX_GOLD:
+        if is_fx(coin):
+            symbol = disp(coin)
+            st, klines, price = fetch_yahoo(coin)
+            if st != "OK":
+                if st == "ERROR":
+                    feed_ok = False
+                scan[symbol] = {"symbol": symbol, "direction": "NO_DATA", "confluence": "-",
+                                "score": 0, "rsi_1h": None, "last_close": price, "ts": time.time()}
+                continue
+            if price:
+                prices[symbol] = price
+        else:
+            symbol = f"{coin}{QUOTE}"
+            price = fetch_price(symbol)
+            if price:
+                prices[symbol] = price
+            klines = fetch_klines(symbol)
+            if not klines:
+                feed_ok = False
+                scan[symbol] = {"symbol": symbol, "direction": "NO_DATA", "confluence": "-",
+                                "score": 0, "rsi_1h": None, "last_close": price, "ts": time.time()}
+                continue
 
         read = base_read(symbol, klines)
         if price:
@@ -657,7 +779,7 @@ def status():
         })
     rows.sort(key=lambda r: -r["score"])
     return jsonify({
-        "watchlist": [f"{c}{QUOTE}" for c in WATCHLIST],
+        "watchlist": [disp(c) if is_fx(c) else f"{c}{QUOTE}" for c in WATCHLIST + FOREX_GOLD],
         "timeframes": TIMEFRAMES,
         "cycle_minutes": CYCLE_MINUTES,
         "cycles": STATE.get("cycle_count", 0),
@@ -769,7 +891,7 @@ button:disabled{filter:grayscale(.6);cursor:wait}
 <header>
   <div>
     <h1>THE CREW · SIGNAL DESK</h1>
-    <div class="tag">Four AI agents. One desk. Full consensus or no trade · <span class="mono">15m / 1h / 4h / 1d</span> confluence · self-audited record</div>
+    <div class="tag">Four AI agents. One desk. Full consensus or no trade · <span class="mono">15m / 1h / 4h / 1d</span> confluence · crypto + FX + gold · self-audited record</div>
   </div>
   <div style="display:flex;align-items:center;gap:14px">
     <div class="live"><span class="dot"></span><span id="live">syncing…</span></div>
