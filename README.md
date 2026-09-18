@@ -110,3 +110,38 @@ filtering, anti-chase entry discipline):
   (firing LONGs into falling markets because RSI was oversold).
 - **Confidence scores** are now strength-weighted: ADX 25+/30+ and MACD
   alignment add to the score, capped at 95% (no more fake 100%).
+
+## Character faces (v1.6)
+
+Each crew member now has an original face on the dashboard — cel-shaded
+portraits with neon rim-lighting matched to each agent's accent color.
+- Lester (cyan) — sharp-eyed strategist, glasses up on the forehead
+- Michael (violet) — calm, arms crossed, momentum reader
+- Franklin (amber) — heavyset risk manager with the no-nonsense stare
+- Trevor (red) — the unhinged grin of the executor
+
+Faces load from a public CDN and are served through the agents API; if an
+image ever fails to load, the card gracefully falls back to the old letter
+avatar. Same deploy pattern: replace app.py in GitHub, Render redeploys.
+
+## Backtest Lab + Ledger Grade (v1.7)
+
+**Backtest Lab** — the "▶ Run 90-day backtest" button replays history through the
+EXACT live crew logic (same base_read / agent filters / crew_review code path —
+not a re-implementation). Scorecard per symbol: trades, SL rate, TP3 rate,
+TP1-tag rate, avg R, total R, max drawdown in R, and a verdict (EDGE / FLAT /
+AVOID / SMALL N). Crypto replays off Binance history; forex/gold off Yahoo
+(FX 15m depth is capped at ~55 days). Trades that never close are honest: SL
+counts as -1R, TP3 as +3R, TP1/TP2 tags are tracked but the trade runs to SL
+or TP3 — same management as the live desk.
+
+**Ledger Grade** — after every sweep the desk re-grades its own closed ledger:
+- Symbols with 5+ closed trades and negative avg R get BENCHED (can_emit
+  blocks them; Franklin announces the bench in desk chatter).
+- UTC hours with 5+ closed trades and negative avg R become learned VETO
+  hours — Franklin blocks any entry born in a proven losing hour.
+Both self-heal: when the numbers improve (or the ledger shifts), the bench
+and veto lists recompute automatically on the next sweep.
+
+Env knobs: BT_DAYS (default 90), BENCH_MIN_TRADES (5), BENCH_AVG_R (0.0).
+POST /api/backtest {"days":90, "symbols":["BTCUSDT", ...]} for targeted runs.

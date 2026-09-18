@@ -90,6 +90,13 @@ ATR_MULT = 1.5
 TP1_R, TP2_R, TP3_R = 1.0, 2.0, 3.0
 
 RESCAN_MINUTES = int(os.environ.get("RESCAN_MINUTES", "60"))
+
+# Ledger self-grading rails
+BENCH_MIN_TRADES = int(os.environ.get("BENCH_MIN_TRADES", "5"))   # closed trades before a symbol/hour can be judged
+BENCH_AVG_R = float(os.environ.get("BENCH_AVG_R", "0.0"))        # avg realized R below this = loser
+
+# Backtest lab
+BT_DAYS = int(os.environ.get("BT_DAYS", "90"))
 DATA_FILE = os.environ.get("DATA_FILE", "signals.json")
 MAX_HISTORY = 500
 MAX_CHATTER = 160
@@ -132,6 +139,8 @@ STATE = {
     "agent_stats": {},
     "chatter": [],
     "cycle_count": 0,
+    "ledger_grade": {"symbols": {}, "hours": {}, "benched": {}, "bad_hours": []},
+    "backtest": {"running": False, "progress": "", "results": [], "done_at": None},
 }
 
 def _load_signals():
@@ -551,9 +560,14 @@ def franklin(read, direction):
         return {"verdict": "VETO", "line": f"VETO on {read['symbol']} long: RSI {round(r,1)} is stretched to the moon."}
     if direction == "SHORT" and r is not None and r < RSI_OVERSOLD:
         return {"verdict": "VETO", "line": f"VETO on {read['symbol']} short: RSI {round(r,1)} — knife-catch territory."}
+    now_utc = read.get("bt_now") or datetime.now(timezone.utc)
+    # Ledger-learned bad hours: hours where our own closed trades lose money
+    grade = STATE.get("ledger_grade") or {}
+    bad = grade.get("bad_hours") or []
+    if now_utc.hour in bad:
+        return {"verdict": "VETO", "line": f"VETO on {read['symbol']}: {now_utc.hour:02d}:00 UTC is a proven losing hour for this desk (ledger data). Not touching it."}
     # FX/gold: skip the thin rollover hour (wide spreads, fake outs)
     if FX_ROLLOVER_VETO and read.get("is_fx_gold"):
-        now_utc = datetime.now(timezone.utc)
         if (now_utc.hour == 21 and now_utc.minute >= 45) or (now_utc.hour == 22 and now_utc.minute < 15):
             return {"verdict": "VETO", "line": f"VETO on {read['symbol']}: we're in the rollover hour — spreads widen and moves lie. Wait it out."}
     # Don't chase: price too far from the 20 EMA means the move is already stretched
@@ -652,6 +666,7 @@ def build_signal(read, direction):
         "confidence": conf,
         "rsi_1h": round(read["rsi_1h"], 1) if read["rsi_1h"] is not None else None,
         "created": datetime.now(timezone.utc).isoformat(),
+        "hour_utc": read.get("hour_utc", datetime.now(timezone.utc).hour),
         "status": "OPEN",
         "outcome": None,
         "closed": None,
@@ -697,6 +712,9 @@ def compute_agent_stats(signals):
 
 def can_emit(symbol, direction):
     now = time.time()
+    benched = (STATE.get("ledger_grade") or {}).get("benched") or {}
+    if symbol in benched:
+        return False
     for sig in STATE["signals"]:
         if sig["symbol"] != symbol or sig["direction"] != direction:
             continue
@@ -708,6 +726,264 @@ def can_emit(symbol, direction):
             t = 0
         if now - t < RESCAN_MINUTES * 60:
             return False
+    return True
+
+# ----------------------------------------------------------------------------
+# LEDGER SELF-GRADE (bench losers, learn bad hours)
+# ----------------------------------------------------------------------------
+
+def _realized_r(sig):
+    """Honest realized R under the desk's management: SL = -1, TP3 = +3."""
+    if sig["outcome"] == "TP3_HIT":
+        return 3.0
+    if sig["outcome"] == "SL_HIT":
+        return -1.0
+    return 0.0
+
+def compute_ledger_grade():
+    closed = [s for s in STATE["signals"] if s.get("status") == "CLOSED"]
+    per_sym, per_hour = {}, {}
+    for s in closed:
+        r = _realized_r(s)
+        per_sym.setdefault(s["symbol"], []).append(r)
+        h = s.get("hour_utc")
+        if h is not None:
+            per_hour.setdefault(int(h), []).append(r)
+
+    def agg(rs):
+        return {"n": len(rs), "avg_r": round(sum(rs) / len(rs), 2),
+                "win_rate": round(100.0 * sum(1 for r in rs if r > 0) / len(rs), 1)}
+
+    symbols = {k: agg(v) for k, v in per_sym.items()}
+    hours = {k: agg(v) for k, v in per_hour.items()}
+    benched = {k: v for k, v in symbols.items()
+               if v["n"] >= BENCH_MIN_TRADES and v["avg_r"] < BENCH_AVG_R}
+    bad_hours = sorted(k for k, v in hours.items()
+                       if v["n"] >= BENCH_MIN_TRADES and v["avg_r"] < BENCH_AVG_R)
+    STATE["ledger_grade"] = {"symbols": symbols, "hours": hours,
+                             "benched": benched, "bad_hours": bad_hours}
+    return STATE["ledger_grade"]
+
+# ----------------------------------------------------------------------------
+# BACKTEST LAB — replays history through the EXACT live crew logic
+# ----------------------------------------------------------------------------
+
+BT_IV_MS = {"15m": 15 * 60_000, "1h": 3_600_000, "4h": 4 * 3_600_000, "1d": 86_400_000}
+
+def _bt_yahoo(coin, interval, days):
+    """Yahoo history -> (opens_ms, candles [o,h,l,c,v]) or (None, None)."""
+    p2 = int(time.time())
+    p1 = p2 - int(days * 86400)
+    def _do(base):
+        try:
+            r = requests.get(
+                base + "/v8/finance/chart/" + coin,
+                params={"interval": interval, "period1": p1, "period2": p2},
+                headers=UA_HEADERS, timeout=FETCH_TIMEOUT)
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            return None
+    payload = None
+    for base in YAHOO_BASES:
+        payload = _do(base)
+        if payload:
+            break
+    raw, _ = _yahoo_candles(payload)
+    if not raw:
+        return None, None
+    opens = [int(t) * 1000 for t, *_ in raw]
+    candles = [[o, h, l, c, v] for _, o, h, l, c, v in raw]
+    return opens, candles
+
+def _bt_binance(symbol, interval, days):
+    """Paginated Binance history -> (opens_ms, candles)."""
+    end = int(time.time() * 1000)
+    start = end - int(days * 86_400_000)
+    rows = []
+    while True:
+        try:
+            r = None
+            for base in BINANCE_BASES:
+                try:
+                    r = requests.get(
+                        base + "/api/v3/klines",
+                        params={"symbol": symbol, "interval": interval,
+                                "startTime": start, "endTime": end, "limit": 1000},
+                        timeout=FETCH_TIMEOUT)
+                    if r.ok:
+                        break
+                    r = None
+                except Exception:
+                    continue
+            if not r or not r.ok:
+                return None, None
+            batch = r.json()
+            if not batch:
+                break
+            rows.extend(batch)
+            if len(batch) < 1000:
+                break
+            start = int(batch[-1][0]) + 1
+        except Exception:
+            return None, None
+    if not rows:
+        return None, None
+    opens = [int(c[0]) for c in rows]
+    candles = [[float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in rows]
+    return opens, candles
+
+def _bt_resample_4h(opens, candles):
+    """1h -> 4h bars, keeping open times."""
+    groups, order = {}, []
+    for o, c in zip(opens, candles):
+        key = (o // BT_IV_MS["4h"]) * BT_IV_MS["4h"]
+        if key not in groups:
+            groups[key] = [c[0], c[1], c[2], c[3], c[4]]
+            order.append(key)
+            continue
+        g = groups[key]
+        g[1] = max(g[1], c[1]); g[2] = min(g[2], c[2])
+        g[3] = c[3]; g[4] += c[4]
+    return order, [groups[k] for k in order]
+
+def bt_symbol(symbol, is_fx, coin, days):
+    """Replay one symbol through the live crew logic. Returns metrics dict."""
+    import bisect
+    data = {}
+    for tf in TIMEFRAMES:
+        # lookback deep enough for EMA200 on every TF
+        # FX trades ~5/7 of calendar days — widen lookback so EMA200 still has data
+        need = max(days, int(210 * BT_IV_MS[tf] / 86_400_000 * (1.45 if is_fx else 1.0)) + 5)
+        if tf == "1d":
+            need = max(need, 400 if is_fx else 260)  # FX daily skips weekends
+        if is_fx:
+            if tf == "15m":
+                need = min(need, 55)  # Yahoo 15m depth cap
+            if tf == "4h":
+                o1, c1 = _bt_yahoo(coin, "1h", max(need, 10))
+                if not o1:
+                    return {"symbol": symbol, "error": "no data"}
+                o, c = _bt_resample_4h(o1, c1)
+            else:
+                o, c = _bt_yahoo(coin, tf, need)
+        else:
+            o, c = _bt_binance(symbol, tf, need)
+        if not o or len(c) < 200:  # EMA200 floor
+            return {"symbol": symbol, "error": "insufficient history"}
+        data[tf] = (o, c)
+    close_ms = {tf: [o + BT_IV_MS[tf] for o in data[tf][0]] for tf in TIMEFRAMES}
+    c15o, c15 = data["15m"]
+    if is_fx:
+        days = min(days, 55)
+
+    trades = []
+    pos = None
+    for i in range(len(c15)):
+        bar = c15[i]
+        t_close = c15o[i] + BT_IV_MS["15m"]
+        slices, ok = {}, True
+        for tf in TIMEFRAMES:
+            cnt = bisect.bisect_right(close_ms[tf], t_close)
+            if cnt < 200:  # EMA200 floor
+                ok = False
+                break
+            slices[tf] = data[tf][1][max(0, cnt - 210):cnt]
+        if not ok:
+            continue
+
+        if pos is not None:
+            risk = abs(pos["entry"] - pos["sl"])
+            if risk <= 0:
+                pos = None
+                continue
+            hit = False
+            if pos["long"]:
+                if bar[2] <= pos["sl"]:
+                    trades.append({"r": -1.0, "mfe": pos["mfe"], "hour": pos["hour"]}); hit = True
+                elif bar[1] >= pos["tp3"]:
+                    trades.append({"r": 3.0, "mfe": max(pos["mfe"], (bar[1] - pos["entry"]) / risk), "hour": pos["hour"]}); hit = True
+                else:
+                    pos["mfe"] = max(pos["mfe"], (bar[1] - pos["entry"]) / risk)
+            else:
+                if bar[1] >= pos["sl"]:
+                    trades.append({"r": -1.0, "mfe": pos["mfe"], "hour": pos["hour"]}); hit = True
+                elif bar[2] <= pos["tp3"]:
+                    trades.append({"r": 3.0, "mfe": max(pos["mfe"], (pos["entry"] - bar[2]) / risk), "hour": pos["hour"]}); hit = True
+                else:
+                    pos["mfe"] = max(pos["mfe"], (pos["entry"] - bar[2]) / risk)
+            if hit:
+                pos = None
+            continue
+
+        read = base_read(symbol, slices)
+        read["last_close"] = bar[3]
+        read["bt_now"] = datetime.fromtimestamp(t_close / 1000.0, tz=timezone.utc)
+        read["hour_utc"] = read["bt_now"].hour
+        try:
+            sig, _v, _l = crew_review(read)
+        except Exception:
+            continue
+        if sig is None:
+            continue
+        pos = {"long": sig["direction"] == "LONG", "entry": sig["entry"],
+               "sl": sig["stop_loss"], "tp3": sig["tp3"], "mfe": 0.0,
+               "hour": read["hour_utc"], "dir": sig["direction"]}
+
+    n = len(trades)
+    if n == 0:
+        return {"symbol": symbol, "trades": 0, "note": "crew fired on nothing — filters held",
+                "days": days}
+    rs = [t["r"] for t in trades]
+    cum, peak, max_dd = 0.0, 0.0, 0.0
+    for r in rs:
+        cum += r
+        peak = max(peak, cum)
+        max_dd = min(max_dd, cum - peak)
+    res = {
+        "symbol": symbol, "days": days, "trades": n,
+        "sl_rate": round(100.0 * sum(1 for t in trades if t["r"] < 0) / n, 1),
+        "tp3_rate": round(100.0 * sum(1 for t in trades if t["r"] > 0) / n, 1),
+        "tp1_touch": round(100.0 * sum(1 for t in trades if t["mfe"] >= 1.0) / n, 1),
+        "avg_r": round(sum(rs) / n, 2),
+        "expectancy_r": round(sum(rs), 1),
+        "max_dd_r": round(max_dd, 1),
+    }
+    if n >= 8 and res["avg_r"] >= 0.5:
+        res["verdict"] = "EDGE"
+    elif n >= 8 and res["avg_r"] <= -0.3:
+        res["verdict"] = "AVOID"
+    else:
+        res["verdict"] = "FLAT" if n >= 8 else "SMALL N"
+    return res
+
+def bt_run(days=BT_DAYS, symbols=None):
+    if STATE["backtest"].get("running"):
+        return False
+    STATE["backtest"] = {"running": True, "progress": "starting…", "results": [], "done_at": None}
+    def _work():
+        try:
+            targets = symbols or ([f"{c}{QUOTE}" for c in WATCHLIST] + [disp(t) for t in FOREX_GOLD])
+            results = []
+            for idx, sym in enumerate(targets):
+                STATE["backtest"]["progress"] = f"replaying {sym} ({idx + 1}/{len(targets)})…"
+                if sym in FX_SYMBOLS:
+                    coin = next((t for t in FOREX_GOLD if disp(t) == sym), None)
+                    if coin is None:
+                        continue
+                    r = bt_symbol(sym, True, coin, days)
+                else:
+                    r = bt_symbol(sym, False, None, days)
+                results.append(r)
+                STATE["backtest"]["results"] = results
+            STATE["backtest"]["progress"] = f"done — {len(results)} symbols replayed over ~{days}d"
+            STATE["backtest"]["done_at"] = time.time()
+        except Exception as e:
+            STATE["backtest"]["progress"] = f"error: {e}"
+            STATE["backtest"]["running"] = False
+        finally:
+            STATE["backtest"]["running"] = False
+    threading.Thread(target=_work, daemon=True).start()
     return True
 
 # ----------------------------------------------------------------------------
@@ -760,7 +1036,13 @@ def run_cycle():
             chatter.append(entry)
 
         if sig is not None:
-            if can_emit(symbol, sig["direction"]):
+            benched = (STATE.get("ledger_grade") or {}).get("benched") or {}
+            if symbol in benched:
+                b = benched[symbol]
+                chatter.append(_say("franklin",
+                    f"{symbol} setup killed by the numbers: ledger shows {b['win_rate']}% wins over {b['n']} trades (avg {b['avg_r']}R). Benched until it earns its way back.",
+                    symbol))
+            elif can_emit(symbol, sig["direction"]):
                 sig["crew"] = verdicts
                 new_signals.append(sig)
                 log.info("CREW SIGNAL %s %s @ %s conf=%d%%",
@@ -794,6 +1076,8 @@ def run_cycle():
             work["generation"] = gen
             work["last_cycle_ts"] = time.time()
             work["cycle_alive"] = False
+            # fields owned by other threads (backtest lab) stay live:
+            work["backtest"] = STATE.get("backtest") or {}
             STATE.update(work)
             _save_signals()
             log.info("cycle gen %d committed: %d scanned, %d new signals", gen, len(scan), len(new_signals))
@@ -836,6 +1120,11 @@ def update_open_signals_work(work, prices):
         if sig["status"] == "CLOSED":
             sig["closed"] = datetime.now(timezone.utc).isoformat()
             changed = True
+    if changed:
+        try:
+            compute_ledger_grade()
+        except Exception:
+            pass
     return changed
 
 # ----------------------------------------------------------------------------
@@ -906,6 +1195,8 @@ def status():
         "last_error": STATE["last_error"],
         "last_cycle_ts": STATE["last_cycle_ts"],
         "agents": AGENTS,
+        "ledger_grade": STATE.get("ledger_grade") or {},
+        "backtest": STATE.get("backtest") or {},
         "open_signals": [s for s in STATE["signals"] if s["status"] == "OPEN"],
         "signals": list(reversed(STATE["signals"]))[:40],
         "stats": STATE.get("stats") or compute_stats(STATE["signals"]),
@@ -913,6 +1204,21 @@ def status():
         "chatter": list(reversed(STATE["chatter"]))[:60],
         "scan_rows": rows,
     })
+
+@app.route("/api/backtest", methods=["POST"])
+def backtest_route():
+    payload = request.get_json(silent=True) or {}
+    days = int(payload.get("days") or BT_DAYS)
+    days = max(20, min(days, 180))
+    syms = payload.get("symbols")
+    if isinstance(syms, list) and syms:
+        syms = [s for s in syms if isinstance(s, str)][:20]
+    else:
+        syms = None
+    started = bt_run(days=days, symbols=syms)
+    if not started:
+        return jsonify({"ok": False, "reason": "backtest already running"}), 429
+    return jsonify({"ok": True, "days": days})
 
 @app.route("/api/run-now", methods=["POST"])
 def run_now():
@@ -1041,6 +1347,23 @@ button:disabled{filter:grayscale(.6);cursor:wait}
   <th>15m</th><th>1h</th><th>4h</th><th>1d</th><th>RSI 1h</th><th>Price</th><th>Crew</th>
 </tr></thead><tbody></tbody></table>
 
+<h2>BACKTEST LAB <span>· history replayed through the live crew logic</span></h2>
+<div style="background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px;margin-bottom:26px">
+  <div style="display:flex;gap:14px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
+    <button id="bt-run" onclick="runBT()">▶ Run 90-day backtest</button>
+    <span id="bt-prog" style="color:var(--muted);font-size:12.5px"></span>
+  </div>
+  <div style="overflow-x:auto">
+  <table id="bt-t">
+    <thead><tr><th>Symbol</th><th>Days</th><th>Trades</th><th>SL %</th><th>TP3 %</th><th>TP1 tag %</th><th>Avg R</th><th>Total R</th><th>Max DD (R)</th><th>Verdict</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  </div>
+</div>
+
+<h2>LEDGER GRADE <span>· the desk benches its own losers</span></h2>
+<div id="grade" style="background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px;margin-bottom:26px"></div>
+
 <h2>SIGNAL LEDGER <span>· latest 40, self-audited</span></h2>
 <table id="sig-t"><thead><tr>
   <th>Time</th><th>Symbol</th><th>Dir</th><th>Conf</th><th>Entry</th><th>SL</th><th>TP1</th><th>TP2</th><th>TP3</th><th>Outcome</th><th>Best R</th>
@@ -1071,6 +1394,8 @@ async function pull(){
 }
 
 function render(d){
+  renderBT(d.backtest || {});
+  renderGrade(d.ledger_grade || {});
   for (const k in d.agents) A[k] = d.agents[k];
   const live = document.getElementById('live');
   const age = d.last_cycle_ts ? Math.round((Date.now()/1000 - d.last_cycle_ts)) : null;
@@ -1135,6 +1460,53 @@ function render(d){
       <td class="mono">${fmt(s.tp1)}</td><td class="mono">${fmt(s.tp2)}</td><td class="mono">${fmt(s.tp3)}</td>
       <td class="${cls}">${out.replace('_HIT','')}</td><td class="mono">${s.max_favorable_r}R</td></tr>`;
   }).join('') || '<tr><td colspan="11" style="color:var(--muted)">No signals yet — the crew only fires on full consensus.</td></tr>';
+}
+
+async function runBT(days=90){
+  const b = document.getElementById('bt-run');
+  b.disabled = true;
+  try {
+    const r = await fetch('/api/backtest', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({days})});
+    const x = await r.json();
+    if(!x.ok) alert(x.reason || 'could not start backtest');
+  } catch(e) { alert('could not start backtest'); }
+  setTimeout(()=>b.disabled=false, 1500);
+}
+
+function renderBT(bt){
+  const el = document.getElementById('bt-prog');
+  el.textContent = bt.progress || (bt.results && bt.results.length ? 'done' : 'never run');
+  const tb = document.getElementById('bt-t').querySelector('tbody');
+  tb.innerHTML = (bt.results||[]).map(r=>{
+    if(r.error) return `<tr><td>${r.symbol}</td><td colspan="9" style="color:var(--muted)">${r.error}</td></tr>`;
+    const v = r.verdict || '—';
+    const vc = v==='EDGE' ? '#34d399' : (v==='AVOID' ? '#ef4444' : 'var(--muted)');
+    const trades = r.trades || 0;
+    if(!trades) return `<tr><td>${r.symbol}</td><td>${r.days||'—'}</td><td>0</td><td colspan="7" style="color:var(--muted)">${r.note||'crew fired on nothing'}</td></tr>`;
+    return `<tr><td>${r.symbol}</td><td>${r.days}</td><td>${trades}</td><td>${r.sl_rate}%</td><td>${r.tp3_rate}%</td><td>${r.tp1_touch}%</td><td>${r.avg_r}</td><td>${r.expectancy_r}</td><td>${r.max_dd_r}</td><td style="color:${vc};font-weight:700">${v}</td></tr>`;
+  }).join('');
+}
+
+function renderGrade(g){
+  const el = document.getElementById('grade');
+  const syms = Object.entries(g.symbols||{}).sort((a,b)=>(b[1].avg_r||0)-(a[1].avg_r||0));
+  if(!syms.length){
+    el.innerHTML = '<div style="color:var(--muted);font-size:13px">No closed trades graded yet — the ledger grades itself as trades close. Symbols that lose get benched; hours that lose get vetoed.</div>';
+    return;
+  }
+  const bench = g.benched || {};
+  const rows = syms.map(([s,v])=>`
+    <div style="display:flex;gap:16px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line);font-size:13px;flex-wrap:wrap">
+      <b style="min-width:86px">${s}</b>
+      <span style="color:var(--muted)">${v.n} trades</span>
+      <span>win ${v.win_rate}%</span>
+      <span>avg ${v.avg_r}R</span>
+      ${bench[s] ? '<span style="color:#ef4444;font-weight:700">BENCHED</span>' : ''}
+    </div>`).join('');
+  const bh = (g.bad_hours||[]);
+  const hours = bh.length ? `<div style="margin-top:12px;color:#ef4444;font-size:13px"><b>Learned veto hours (UTC):</b> ${bh.map(h=>h+':00').join(', ')} — Franklin blocks entries born in these hours</div>`
+    : '<div style="margin-top:12px;color:var(--muted);font-size:12.5px">No losing hours proven yet (needs '+(g.min_trades||5)+'+ closed trades per hour)</div>';
+  el.innerHTML = rows + hours;
 }
 
 async function runNow(){
