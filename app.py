@@ -76,7 +76,7 @@ RSI_OVERBOUGHT = float(os.environ.get("RSI_OVERBOUGHT", "65"))
 
 # Michael's momentum window: LONG needs RSI in [MO_FLOOR, RSI_OVERBOUGHT],
 # SHORT needs RSI in [RSI_OVERSOLD, 100 - MO_FLOOR]
-MO_FLOOR = float(os.environ.get("MO_FLOOR", "45"))
+MO_FLOOR = float(os.environ.get("MO_FLOOR", "50"))
 
 # Franklin's risk rails
 MAX_ATR_PCT = float(os.environ.get("MAX_ATR_PCT", "6.0"))  # ATR/price ceiling
@@ -433,7 +433,7 @@ def michael(read):
             return {"verdict": "LONG", "line": f"Momentum's live on {read['symbol']} — RSI {rc}, room before it's cooked."}
         return {"verdict": "NEUTRAL", "line": f"{read['symbol']} momentum's flat (RSI {rc}). Wait for fuel."}
     if read["bear"] >= MIN_CONFLUENCE:
-        if rc <= 55:
+        if rc <= (100 - MO_FLOOR):
             return {"verdict": "SHORT", "line": f"{read['symbol']} is rolling over — RSI {rc}, downside has room."}
         return {"verdict": "NEUTRAL", "line": f"{read['symbol']} still too perky to short (RSI {rc})."}
     return {"verdict": "NEUTRAL", "line": f"{read['symbol']}: momentum fine but no setup to confirm."}
