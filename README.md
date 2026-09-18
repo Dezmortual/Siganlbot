@@ -1,51 +1,40 @@
-# Signal Scanner Bot
+# THE CREW · Signal Desk
 
-A Tradebise-style signal scanner, built on free public market data (Binance spot
-API — no key, no account, no paywall). It scans a watchlist across four
-timeframes (15m / 1h / 4h / 1d) and only fires a signal when at least 3 of 4
-timeframes agree (multi-timeframe confluence).
+Four AI agents run one trading desk. A signal fires only on **full crew consensus**.
 
-Every signal comes with:
-- Entry price
-- Stop-loss (1.5 × ATR)
-- TP1 / TP2 / TP3 (1R / 2R / 3R)
-- Confidence score
+| Agent | Job | What they check |
+|-------|-----|-----------------|
+| **Lester** (analyst) | Structure | EMA 20/50/200 stack across 15m / 1h / 4h / 1d — needs 3+ timeframes agreeing |
+| **Michael** (momentum) | Fuel | 1h RSI must have room to run — he vetoes blow-off tops and knife catches |
+| **Franklin** (risk) | Risk rails | Audits ATR geometry — vetoes anything with crazy volatility or stretched RSI |
+| **Trevor** (executor) | Execution | Fires only after Lester + Michael agree AND Franklin approves |
 
-## Self-auditing
+Every signal carries entry, stop-loss (1.5× ATR) and TP1/TP2/TP3 at 1R/2R/3R.
+The ledger self-audits: each closed signal is tracked to TP or SL, and the
+dashboard's win rate is computed from real closed trades — not marketing.
 
-The bot tracks every signal it emits and checks it against live prices on each
-cycle. A signal closes at TP3 or SL, and the dashboard shows the REAL win rate,
-average R, and best/worst trades — like Tradebise's "we publish our losses next
-to our wins", except you can verify it yourself.
+The desk chatter feed shows the agents discussing every sweep live, including
+when they REFUSE a trade (that's the discipline working).
 
-## Deploy on Render (same as your other bots)
+## Files
 
-1. Create a new Web Service, connect your GitHub repo.
-2. Upload the two files from this zip (app.py + requirements.txt) to the repo
-   root (no subfolders — the GitHub web UI drops folders).
+- `app.py` — everything (single file, no subfolders)
+- `requirements.txt` — flask, requests, gunicorn
+- `env_example.txt` — optional settings (watchlist, cycle time, RSI rails)
+- `README.md` — this file
+
+## Deploy on Render
+
+1. Create a new **Web Service** from your GitHub repo (upload all 4 files to the repo ROOT — the GitHub web UI drops subfolders, so keep everything flat).
+2. Environment: Python 3.
 3. Build command: `pip install -r requirements.txt`
-4. Start command:
-   `gunicorn --workers 1 --threads 4 --timeout 60 --bind 0.0.0.0:$PORT app:app`
-5. Optional: add environment variables from env_example.txt (WATCHLIST,
-   CYCLE_MINUTES, etc.). Defaults work fine.
+4. Start command: `gunicorn --workers 1 --threads 4 --timeout 60 --bind 0.0.0.0:$PORT app:app`
+5. Add a free external pinger (UptimeRobot / cron-job.org) hitting `https://YOUR-APP.onrender.com/health` every 10 minutes so the watchdog keeps the desk trading on the free tier.
 
-## Keep-alive
+No API keys needed — it uses Binance spot public data.
 
-Like your other bots on Render free tier, the background loop needs help
-surviving. The built-in watchdog restarts a scan if a web request arrives and
-the last scan is stale, so point UptimeRobot (or cron-job.org) at `/health`
-every 10 minutes.
+## Notes
 
-## Endpoints
-
-- `/` — dashboard (scan table, signals, win rate)
-- `/health` — keep-alive ping
-- `/api/status` — JSON status + open signals + stats
-- `/api/signals?limit=50` — signal history JSON
-- `/api/run-now` (POST) — trigger an immediate scan
-
-## Honest disclaimer
-
-No scanner gives "accurate" signals. This one only fires on strong confluence
-and shows you its verified hit rate so you can judge it with data. Signals are
-analysis, not financial advice. DYOR, never trade money you can't afford to lose.
+- Signals persist to `signals.json` (survives restarts on the same disk).
+- A trade fires only when Lester AND Michael agree on direction AND Franklin approves. Trevor then executes.
+- This is a signal tool, not financial advice. It never places orders.

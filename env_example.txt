@@ -3,12 +3,18 @@
 # Comma-separated coins to scan (vs USDT on Binance spot)
 WATCHLIST=BTC,ETH,SOL,BNB,XRP,DOGE,ADA,LINK,AVAX,TON
 
-# Minutes between scan cycles
+# Minutes between crew sweeps
 CYCLE_MINUTES=30
+
+# Minimum confluence (of 4 timeframes) Lester needs before proposing a trade
+MIN_CONFLUENCE=3
 
 # RSI thresholds for stretched/exhausted filtering (defaults shown)
 RSI_OVERSOLD=35
 RSI_OVERBOUGHT=65
+
+# Franklin's risk rails: max ATR as % of price before he vetoes
+MAX_ATR_PCT=6.0
 
 # Minutes before the same symbol+direction may signal again
 RESCAN_MINUTES=60
