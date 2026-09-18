@@ -105,10 +105,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("crew")
 
 AGENTS = {
-    "lester":   {"name": "Lester",   "role": "Head Analyst",  "color": "#22d3ee", "glyph": "L"},
-    "michael":  {"name": "Michael",  "role": "Momentum",      "color": "#a78bfa", "glyph": "M"},
-    "franklin": {"name": "Franklin", "role": "Risk Manager",  "color": "#f59e0b", "glyph": "F"},
-    "trevor":   {"name": "Trevor",   "role": "Executor",      "color": "#ef4444", "glyph": "T"},
+    "lester":   {"name": "Lester",   "role": "Head Analyst",  "color": "#22d3ee", "glyph": "L",
+                 "img": "https://media.base44.com/images/public/6aa89406a2d9664f56be6f5c/6a86a36f1_generated_image.png"},
+    "michael":  {"name": "Michael",  "role": "Momentum",      "color": "#a78bfa", "glyph": "M",
+                 "img": "https://media.base44.com/images/public/6aa89406a2d9664f56be6f5c/0fe37be48_generated_image.png"},
+    "franklin": {"name": "Franklin", "role": "Risk Manager",  "color": "#f59e0b", "glyph": "F",
+                 "img": "https://media.base44.com/images/public/6aa89406a2d9664f56be6f5c/37e03db2b_generated_image.png"},
+    "trevor":   {"name": "Trevor",   "role": "Executor",      "color": "#ef4444", "glyph": "T",
+                 "img": "https://media.base44.com/images/public/6aa89406a2d9664f56be6f5c/1b58a25bf_generated_image.png"},
 }
 
 # ----------------------------------------------------------------------------
@@ -961,8 +965,9 @@ h1{font-size:clamp(24px,4vw,34px);font-weight:800;letter-spacing:-.02em;
 .agent:hover{border-color:rgba(120,150,220,.3)}
 .agent::before{content:'';position:absolute;inset:0 0 auto 0;height:3px;background:var(--ac)}
 .agent .top{display:flex;align-items:center;gap:12px;margin-bottom:12px}
-.avatar{width:42px;height:42px;border-radius:12px;display:flex;align-items:center;justify-content:center;
+.avatar{width:42px;height:42px;border-radius:12px;display:flex;align-items:center;justify-content:center;overflow:hidden;
         font-weight:800;font-size:17px;color:#04060d;background:var(--ac);box-shadow:0 0 22px color-mix(in srgb,var(--ac) 45%,transparent)}
+.avatar img,.msg .av img{width:100%;height:100%;object-fit:cover;border-radius:inherit;display:block}
 .agent .name{font-weight:700;font-size:16px}
 .agent .role{color:var(--muted);font-size:12px}
 .agent .last{font-size:12.5px;color:var(--muted);line-height:1.5;margin-top:10px;min-height:38px}
@@ -973,7 +978,7 @@ h2 span{color:var(--text)}
 .msg{display:flex;gap:11px;margin-bottom:14px;animation:rise .35s ease}
 @keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 .msg .av{flex:0 0 30px;height:30px;border-radius:9px;background:var(--ac);color:#04060d;font-weight:800;font-size:13px;
-         display:flex;align-items:center;justify-content:center}
+         display:flex;align-items:center;justify-content:center;overflow:hidden}
 .msg .who{font-size:12px;font-weight:700;margin-bottom:2px}
 .msg .who i{font-style:normal;color:var(--muted);font-weight:500;margin-left:6px}
 .msg .tx{font-size:13.5px;line-height:1.5;color:#c9d2e6}
@@ -1097,7 +1102,7 @@ function render(d){
   document.getElementById('agents').innerHTML = Object.entries(d.agents).map(([k,a])=>{
     const lw = lastWords[k];
     return `<div class="agent" style="--ac:${a.color}">
-      <div class="top"><div class="avatar">${a.glyph}</div>
+      <div class="top"><div class="avatar">${a.img ? `<img src="${a.img}" alt="${a.name}" loading="lazy" onerror="this.remove()">` : a.glyph}</div>
         <div><div class="name">${a.name}</div><div class="role">${a.role}</div></div></div>
       <div class="last">${lw ? `<b>${lw.s||'desk'}:</b> ${lw.t}` : 'Waiting for the first sweep…'}</div>
     </div>`;}).join('');
@@ -1106,7 +1111,7 @@ function render(d){
   document.getElementById('feed').innerHTML = (d.chatter||[]).map(m=>{
     const a = d.agents[m.a] || {glyph:'?',color:'#888',name:m.a};
     return `<div class="msg" style="--ac:${a.color}">
-      <div class="av">${a.glyph}</div>
+      <div class="av">${a.img ? `<img src="${a.img}" alt="${a.name}" loading="lazy" onerror="this.remove()">` : a.glyph}</div>
       <div><div class="who" style="color:${a.color}">${a.name}<i>${m.s||''}${m.ts?(' · '+new Date(m.ts*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})):''}</i></div>
       <div class="tx">${m.t}</div></div>
     </div>`;}).join('') || '<div class="msg"><div class="tx" style="color:var(--muted)">Quiet desk. Run a sweep.</div></div>';
