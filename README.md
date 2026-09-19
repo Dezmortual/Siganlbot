@@ -167,3 +167,22 @@ scans 24/7.
 All Yahoo calls (live sweep + backtest lab) now share one pacer: a request
 every YAHOO_MIN_INTERVAL (0.5s default) with a retry pass, so running a full
 backtest no longer starves the live sweep into NO_DATA via throttling.
+
+## Fake timeout fix (v1.8.2)
+
+Root cause of persistent "reads went stale, watchdog + manual sweep both
+stuck" incidents even with an external pinger running: every network fetch
+used `with ThreadPoolExecutor(...) as ex:` to enforce a 20s hard bound via
+`fut.result(timeout=...)`. That pattern is broken — Python's context manager
+calls `shutdown(wait=True)` on exit, which blocks until the worker thread
+actually finishes, regardless of whether `.result()` already raised a
+timeout. A single genuinely-hung DNS/socket call (rare, but happens on
+Render's network) could freeze that "bounded" fetch forever, which froze the
+whole cycle, which left `cycle_alive` stuck True forever — so neither the
+watchdog nor the "Run sweep" button could ever recover it. Only a manual
+restart cleared it.
+
+Fixed by dropping the blocking `with` and calling `ex.shutdown(wait=False)`
+in a `finally`, so a hung fetch is abandoned (leaked, dies on its own later)
+instead of blocking the caller. Verified with a simulated 60s hang: fetch now
+returns in the intended 20s instead of blocking the full 60s.

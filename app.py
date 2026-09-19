@@ -182,12 +182,14 @@ def _bounded_get(path, params=None):
                 return res
         return None
 
-    with ThreadPoolExecutor(max_workers=1) as ex:
+    ex = ThreadPoolExecutor(max_workers=1)
+    try:
         fut = ex.submit(_run)
-        try:
-            return fut.result(timeout=FETCH_HARD_BOUND)
-        except Exception:
-            return None
+        return fut.result(timeout=FETCH_HARD_BOUND)
+    except Exception:
+        return None
+    finally:
+        ex.shutdown(wait=False)  # never block on a hung fetch thread
 
 def fetch_klines(symbol):
     out = {}
@@ -262,12 +264,14 @@ def _yahoo_chart(symbol, interval, rng):
                 time.sleep(2.0)
         return None
 
-    with ThreadPoolExecutor(max_workers=1) as ex:
+    ex = ThreadPoolExecutor(max_workers=1)
+    try:
         fut = ex.submit(_run)
-        try:
-            return fut.result(timeout=FETCH_HARD_BOUND)
-        except Exception:
-            return None
+        return fut.result(timeout=FETCH_HARD_BOUND)
+    except Exception:
+        return None
+    finally:
+        ex.shutdown(wait=False)  # never block on a hung fetch thread
 
 def _yahoo_candles(payload):
     """-> (list of [t,o,h,l,c,v], regularMarketPrice) or (None, None)."""
