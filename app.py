@@ -80,6 +80,7 @@ MO_FLOOR = float(os.environ.get("MO_FLOOR", "50"))
 
 # Franklin's risk rails
 MAX_ATR_PCT = float(os.environ.get("MAX_ATR_PCT", "6.0"))  # ATR/price ceiling
+BE_AT_TP1 = (os.environ.get("BE_AT_TP1", "1") == "1")  # move SL to entry once +1R is tagged
 MAX_EXT_ATR = float(os.environ.get("MAX_EXT_ATR", "2.5"))  # max distance from EMA20, in ATRs (chase filter)
 FX_ROLLOVER_VETO = os.environ.get("FX_ROLLOVER_VETO", "1") == "1"  # skip FX/gold in the thin rollover hour
 
@@ -733,15 +734,18 @@ def can_emit(symbol, direction):
 # ----------------------------------------------------------------------------
 
 def _realized_r(sig):
-    """Honest realized R under the desk's management: SL = -1, TP3 = +3."""
+    """Honest realized R under the desk's management: SL = -1, TP3 = +3, BE = 0."""
     if sig["outcome"] == "TP3_HIT":
         return 3.0
     if sig["outcome"] == "SL_HIT":
         return -1.0
+    if sig["outcome"] == "BE_HIT":
+        return 0.0
     return 0.0
 
-def compute_ledger_grade():
-    closed = [s for s in STATE["signals"] if s.get("status") == "CLOSED"]
+def compute_ledger_grade(signals=None):
+    closed = [s for s in (signals if signals is not None else STATE["signals"])
+             if s.get("status") == "CLOSED"]
     per_sym, per_hour = {}, {}
     for s in closed:
         r = _realized_r(s)
@@ -897,21 +901,32 @@ def bt_symbol(symbol, is_fx, coin, days):
             if risk <= 0:
                 pos = None
                 continue
-            hit = False
+            hit, r_be = False, None
             if pos["long"]:
+                # breakeven shadow: stop = entry once +1R tagged (conservative: arm after this bar)
+                sl_be = pos["entry"] if pos["be_armed"] else pos["sl"]
                 if bar[2] <= pos["sl"]:
-                    trades.append({"r": -1.0, "mfe": pos["mfe"], "hour": pos["hour"]}); hit = True
+                    r_be = 0.0 if pos["be_armed"] else -1.0
+                    trades.append({"r": -1.0, "r_be": r_be, "mfe": pos["mfe"], "hour": pos["hour"]}); hit = True
                 elif bar[1] >= pos["tp3"]:
-                    trades.append({"r": 3.0, "mfe": max(pos["mfe"], (bar[1] - pos["entry"]) / risk), "hour": pos["hour"]}); hit = True
+                    r_be = 3.0
+                    trades.append({"r": 3.0, "r_be": r_be, "mfe": max(pos["mfe"], (bar[1] - pos["entry"]) / risk), "hour": pos["hour"]}); hit = True
                 else:
                     pos["mfe"] = max(pos["mfe"], (bar[1] - pos["entry"]) / risk)
+                    if bar[1] >= pos["tp1"]:
+                        pos["be_armed"] = True
             else:
+                sl_be = pos["entry"] if pos["be_armed"] else pos["sl"]
                 if bar[1] >= pos["sl"]:
-                    trades.append({"r": -1.0, "mfe": pos["mfe"], "hour": pos["hour"]}); hit = True
+                    r_be = 0.0 if pos["be_armed"] else -1.0
+                    trades.append({"r": -1.0, "r_be": r_be, "mfe": pos["mfe"], "hour": pos["hour"]}); hit = True
                 elif bar[2] <= pos["tp3"]:
-                    trades.append({"r": 3.0, "mfe": max(pos["mfe"], (pos["entry"] - bar[2]) / risk), "hour": pos["hour"]}); hit = True
+                    r_be = 3.0
+                    trades.append({"r": 3.0, "r_be": r_be, "mfe": max(pos["mfe"], (pos["entry"] - bar[2]) / risk), "hour": pos["hour"]}); hit = True
                 else:
                     pos["mfe"] = max(pos["mfe"], (pos["entry"] - bar[2]) / risk)
+                    if bar[2] <= pos["tp1"]:
+                        pos["be_armed"] = True
             if hit:
                 pos = None
             continue
@@ -927,31 +942,37 @@ def bt_symbol(symbol, is_fx, coin, days):
         if sig is None:
             continue
         pos = {"long": sig["direction"] == "LONG", "entry": sig["entry"],
-               "sl": sig["stop_loss"], "tp3": sig["tp3"], "mfe": 0.0,
-               "hour": read["hour_utc"], "dir": sig["direction"]}
+               "sl": sig["stop_loss"], "tp1": sig["tp1"], "tp3": sig["tp3"], "mfe": 0.0,
+               "be_armed": False, "hour": read["hour_utc"], "dir": sig["direction"]}
 
     n = len(trades)
     if n == 0:
         return {"symbol": symbol, "trades": 0, "note": "crew fired on nothing — filters held",
                 "days": days}
     rs = [t["r"] for t in trades]
+    rs_be = [t.get("r_be", t["r"]) for t in trades]
     cum, peak, max_dd = 0.0, 0.0, 0.0
-    for r in rs:
+    for r in rs_be:  # drawdown under the live (breakeven) management
         cum += r
         peak = max(peak, cum)
         max_dd = min(max_dd, cum - peak)
+    saved = sum(1 for t in trades if t.get("r_be", t["r"]) > t["r"])
     res = {
         "symbol": symbol, "days": days, "trades": n,
         "sl_rate": round(100.0 * sum(1 for t in trades if t["r"] < 0) / n, 1),
         "tp3_rate": round(100.0 * sum(1 for t in trades if t["r"] > 0) / n, 1),
         "tp1_touch": round(100.0 * sum(1 for t in trades if t["mfe"] >= 1.0) / n, 1),
         "avg_r": round(sum(rs) / n, 2),
-        "expectancy_r": round(sum(rs), 1),
+        "avg_r_be": round(sum(rs_be) / n, 2),
+        "delta_r": round(sum(rs_be) - sum(rs), 1),
+        "be_saved": saved,
+        "expectancy_r": round(sum(rs_be), 1),
         "max_dd_r": round(max_dd, 1),
     }
-    if n >= 8 and res["avg_r"] >= 0.5:
+    judge = sum(rs_be) / n  # verdict under live management (breakeven ON)
+    if n >= 8 and judge >= 0.5:
         res["verdict"] = "EDGE"
-    elif n >= 8 and res["avg_r"] <= -0.3:
+    elif n >= 8 and judge <= -0.3:
         res["verdict"] = "AVOID"
     else:
         res["verdict"] = "FLAT" if n >= 8 else "SMALL N"
@@ -1094,11 +1115,25 @@ def update_open_signals_work(work, prices):
         if not p:
             continue
         risk = risk_distance(sig)
+        if risk <= 0 and sig.get("orig_sl") is not None:
+            risk = abs(sig["entry"] - sig["orig_sl"])  # original risk survives the breakeven move
         if risk <= 0:
             continue
         long = sig["direction"] == "LONG"
         fav = ((p - sig["entry"]) / risk) if long else ((sig["entry"] - p) / risk)
         sig["max_favorable_r"] = round(max(sig.get("max_favorable_r", 0.0), fav), 2)
+        # Breakeven rule: once +1R is tagged, the stop rides to entry (free trade)
+        if BE_AT_TP1 and not sig.get("be_moved") and sig["max_favorable_r"] >= 1.0:
+            sig["be_moved"] = True
+            sig["orig_sl"] = sig["stop_loss"]
+            sig["stop_loss"] = sig["entry"]
+            changed = True
+            try:
+                work["chatter"].append(_say("franklin",
+                    f"{sig['symbol']} tagged +1R — stop moved to breakeven. Free trade from here, we don't give it back.",
+                    sig["symbol"]))
+            except Exception:
+                pass
         if long:
             if p <= sig["stop_loss"]:
                 sig["status"], sig["outcome"] = "CLOSED", "SL_HIT"
@@ -1119,10 +1154,12 @@ def update_open_signals_work(work, prices):
                 sig["outcome"] = "TP1_HIT"
         if sig["status"] == "CLOSED":
             sig["closed"] = datetime.now(timezone.utc).isoformat()
+            if sig["outcome"] == "SL_HIT" and sig.get("be_moved"):
+                sig["outcome"] = "BE_HIT"
             changed = True
     if changed:
         try:
-            compute_ledger_grade()
+            work["ledger_grade"] = compute_ledger_grade(work["signals"])
         except Exception:
             pass
     return changed
@@ -1355,7 +1392,7 @@ button:disabled{filter:grayscale(.6);cursor:wait}
   </div>
   <div style="overflow-x:auto">
   <table id="bt-t">
-    <thead><tr><th>Symbol</th><th>Days</th><th>Trades</th><th>SL %</th><th>TP3 %</th><th>TP1 tag %</th><th>Avg R</th><th>Total R</th><th>Max DD (R)</th><th>Verdict</th></tr></thead>
+    <thead><tr><th>Symbol</th><th>Days</th><th>Trades</th><th>SL %</th><th>TP3 %</th><th>TP1 tag %</th><th>Avg R</th><th>Avg R BE</th><th>Δ R</th><th>Total R (BE)</th><th>Max DD (R)</th><th>Verdict</th></tr></thead>
     <tbody></tbody>
   </table>
   </div>
@@ -1452,7 +1489,7 @@ function render(d){
 
   // signals table
   document.getElementById('sig-t').querySelector('tbody').innerHTML = (d.signals||[]).map(s=>{
-    const out = s.outcome || (s.status==='OPEN'?'OPEN':'--');
+    const out = (s.outcome==='BE_HIT'?'BE':s.outcome) || (s.status==='OPEN'?'OPEN':'--');
     const cls = out.startsWith('TP')?'out-tp':(out==='SL_HIT'?'out-sl':'out-open');
     return `<tr><td class="mono">${s.created.slice(5,16).replace('T',' ')}</td><td><b>${s.symbol}</b></td>
       <td>${badge(s.direction)}</td><td class="mono">${s.confidence}%</td>
@@ -1482,8 +1519,10 @@ function renderBT(bt){
     const v = r.verdict || '—';
     const vc = v==='EDGE' ? '#34d399' : (v==='AVOID' ? '#ef4444' : 'var(--muted)');
     const trades = r.trades || 0;
-    if(!trades) return `<tr><td>${r.symbol}</td><td>${r.days||'—'}</td><td>0</td><td colspan="7" style="color:var(--muted)">${r.note||'crew fired on nothing'}</td></tr>`;
-    return `<tr><td>${r.symbol}</td><td>${r.days}</td><td>${trades}</td><td>${r.sl_rate}%</td><td>${r.tp3_rate}%</td><td>${r.tp1_touch}%</td><td>${r.avg_r}</td><td>${r.expectancy_r}</td><td>${r.max_dd_r}</td><td style="color:${vc};font-weight:700">${v}</td></tr>`;
+    if(!trades) return `<tr><td>${r.symbol}</td><td>${r.days||'—'}</td><td>0</td><td colspan="9" style="color:var(--muted)">${r.note||'crew fired on nothing'}</td></tr>`;
+    const dr = (r.delta_r||0);
+    const dc = dr>0 ? '#34d399' : (dr<0 ? '#ef4444' : 'var(--muted)');
+    return `<tr><td>${r.symbol}</td><td>${r.days}</td><td>${trades}</td><td>${r.sl_rate}%</td><td>${r.tp3_rate}%</td><td>${r.tp1_touch}%</td><td>${r.avg_r}</td><td>${r.avg_r_be}</td><td style="color:${dc}">${dr>0?'+':''}${dr}</td><td>${r.expectancy_r}</td><td>${r.max_dd_r}</td><td style="color:${vc};font-weight:700">${v}</td></tr>`;
   }).join('');
 }
 

@@ -145,3 +145,14 @@ and veto lists recompute automatically on the next sweep.
 
 Env knobs: BT_DAYS (default 90), BENCH_MIN_TRADES (5), BENCH_AVG_R (0.0).
 POST /api/backtest {"days":90, "symbols":["BTCUSDT", ...]} for targeted runs.
+
+## Breakeven at TP1 (v1.8)
+
+Once a trade tags +1R, the stop rides to entry — a free trade from there. The
+ledger shows BE as the outcome (0R). Env knob: BE_AT_TP1=0 disables it.
+
+The backtester runs the rule as a shadow A/B on every replay: the scorecard
+shows Avg R (raw) vs Avg R (BE), a ΔR column (what the rule added over the
+window), and how many losses it saved. Verdicts are graded on the BE-managed
+path — the same management the live desk uses. Verified: BTC 90d -1.0 → -0.33
+avg R, EURUSD -1.0 → -0.5, winners (SOL) untouched (they run to TP3 anyway).
