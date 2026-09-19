@@ -156,3 +156,14 @@ shows Avg R (raw) vs Avg R (BE), a ΔR column (what the rule added over the
 window), and how many losses it saved. Verdicts are graded on the BE-managed
 path — the same management the live desk uses. Verified: BTC 90d -1.0 → -0.33
 avg R, EURUSD -1.0 → -0.5, winners (SOL) untouched (they run to TP3 anyway).
+
+## Weekend behavior + Yahoo hardening (v1.8.1)
+
+FX and gold trade ~24/5 — on weekends the desk correctly refuses to vote on
+stale bars. Those rows now show "MARKET CLOSED" in the dashboard instead of
+the alarming "NO_DATA" (a real feed failure still shows NO_DATA). Crypto
+scans 24/7.
+
+All Yahoo calls (live sweep + backtest lab) now share one pacer: a request
+every YAHOO_MIN_INTERVAL (0.5s default) with a retry pass, so running a full
+backtest no longer starves the live sweep into NO_DATA via throttling.
