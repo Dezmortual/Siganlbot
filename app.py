@@ -219,6 +219,19 @@ def fetch_price(symbol):
 # --- Yahoo Finance feed (forex + gold), same hard-bounded pattern ---
 
 UA_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+
+# Yahoo throttle: one request every YAHOO_MIN_INTERVAL seconds, shared by the
+# live sweep and the backtest lab so a replay can't starve the live desk.
+YAHOO_MIN_INTERVAL = float(os.environ.get("YAHOO_MIN_INTERVAL", "0.5"))
+_yahoo_lock = threading.Lock()
+_yahoo_last = [0.0]
+
+def _yahoo_pace():
+    with _yahoo_lock:
+        wait = _yahoo_last[0] + YAHOO_MIN_INTERVAL - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _yahoo_last[0] = time.monotonic()
 FX_SYMBOLS = set(disp(t) for t in FOREX_GOLD)
 
 YAHOO_BASES = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
@@ -228,6 +241,7 @@ FX_STALE_SECONDS = 3 * 3600  # last 15m bar older than this -> market closed
 def _yahoo_chart(symbol, interval, rng):
     def _do(base):
         try:
+            _yahoo_pace()
             r = requests.get(
                 base + "/v8/finance/chart/" + symbol,
                 params={"interval": interval, "range": rng},
@@ -239,10 +253,13 @@ def _yahoo_chart(symbol, interval, rng):
             return None
 
     def _run():
-        for base in YAHOO_BASES:
-            res = _do(base)
-            if res is not None:
-                return res
+        for attempt in range(2):  # one retry pass — Yahoo 429s are transient
+            for base in YAHOO_BASES:
+                res = _do(base)
+                if res is not None:
+                    return res
+            if attempt == 0:
+                time.sleep(2.0)
         return None
 
     with ThreadPoolExecutor(max_workers=1) as ex:
@@ -780,6 +797,7 @@ def _bt_yahoo(coin, interval, days):
     p1 = p2 - int(days * 86400)
     def _do(base):
         try:
+            _yahoo_pace()
             r = requests.get(
                 base + "/v8/finance/chart/" + coin,
                 params={"interval": interval, "period1": p1, "period2": p2},
@@ -789,10 +807,15 @@ def _bt_yahoo(coin, interval, days):
         except Exception:
             return None
     payload = None
-    for base in YAHOO_BASES:
-        payload = _do(base)
+    for attempt in range(2):
+        for base in YAHOO_BASES:
+            payload = _do(base)
+            if payload:
+                break
         if payload:
             break
+        if attempt == 0:
+            time.sleep(2.0)
     raw, _ = _yahoo_candles(payload)
     if not raw:
         return None, None
@@ -1032,7 +1055,8 @@ def run_cycle():
                 if st == "ERROR":
                     feed_ok = False
                 scan[symbol] = {"symbol": symbol, "direction": "NO_DATA", "confluence": "-",
-                                "score": 0, "rsi_1h": None, "last_close": price, "ts": time.time()}
+                                "score": 0, "rsi_1h": None, "last_close": price, "ts": time.time(),
+                                "market_closed": st == "STALE"}
                 continue
             if price:
                 prices[symbol] = price
@@ -1221,6 +1245,7 @@ def status():
             "last_close": r.get("last_close"),
             "votes": r.get("votes") or {},
             "crew": r.get("crew") or {},
+            "market_closed": bool(r.get("market_closed")),
         })
     rows.sort(key=lambda r: -r["score"])
     return jsonify({
@@ -1416,7 +1441,7 @@ button:disabled{filter:grayscale(.6);cursor:wait}
 <script>
 const A = {};
 const fmt = (x, nd) => x == null ? '--' : (x >= 1000 ? x.toLocaleString('en-US',{maximumFractionDigits:2}) : x.toFixed(nd ?? 4));
-const badge = d => `<span class="badge b-${({LONG:'long',SHORT:'short',NEUTRAL:'neutral',VETOED:'vetoed',NO_DATA:'nodata'})[d]||'neutral'}">${d}</span>`;
+const badge = (d, closed) => `<span class="badge b-${({LONG:'long',SHORT:'short',NEUTRAL:'neutral',VETOED:'vetoed',NO_DATA:'nodata'})[d]||'neutral'}">${(d==='NO_DATA'&&closed)?'MARKET CLOSED':d}</span>`;
 const vote = v => `<span class="vote ${v>0?'v-up':(v<0?'v-dn':'v-nt')}">${v>0?'▲':(v<0?'▼':'·')}</span>`;
 const agentBadge = k => A[k] ? `<span style="color:${A[k].color};font-weight:700">${A[k].glyph}</span>` : k;
 
@@ -1482,7 +1507,7 @@ function render(d){
   document.getElementById('scan-t').querySelector('tbody').innerHTML = d.scan_rows.map(r=>{
     const v = r.votes||{}, c = r.crew||{};
     const crew = ['lester','michael','franklin','trevor'].map(k=>c[k]?agentBadge(k):'').join(' ');
-    return `<tr><td><b>${r.symbol}</b></td><td>${badge(r.direction)}</td><td class="mono">${r.confluence}</td>
+    return `<tr><td><b>${r.symbol}</b></td><td>${badge(r.direction, r.market_closed)}</td><td class="mono">${r.confluence}</td>
       <td>${vote(v['15m'])}</td><td>${vote(v['1h'])}</td><td>${vote(v['4h'])}</td><td>${vote(v['1d'])}</td>
       <td class="mono">${r.rsi_1h==null?'--':r.rsi_1h.toFixed(1)}</td><td class="mono">${fmt(r.last_close)}</td><td>${crew}</td></tr>`;
   }).join('');
