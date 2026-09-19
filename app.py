@@ -104,6 +104,7 @@ MAX_CHATTER = 160
 
 CYCLE_MINUTES = float(os.environ.get("CYCLE_MINUTES", "5"))
 BOOT_DELAY_SECONDS = int(os.environ.get("BOOT_DELAY_SECONDS", "30"))
+APP_VERSION = os.environ.get("APP_VERSION", "1.8.3")  # shown in dashboard + API, so live version is always checkable
 
 BINANCE_BASES = ["https://api.binance.com", "https://api1.binance.com", "https://data-api.binance.vision"]
 FETCH_TIMEOUT = 6
@@ -1256,6 +1257,7 @@ def status():
         "watchlist": [disp(c) if is_fx(c) else f"{c}{QUOTE}" for c in WATCHLIST + FOREX_GOLD],
         "timeframes": TIMEFRAMES,
         "cycle_minutes": CYCLE_MINUTES,
+        "version": APP_VERSION,
         "cycles": STATE.get("cycle_count", 0),
         "data_feed_ok": STATE["data_feed_ok"],
         "last_error": STATE["last_error"],
@@ -1382,7 +1384,7 @@ button:disabled{filter:grayscale(.6);cursor:wait}
 <div class="wrap">
 <header>
   <div>
-    <h1>THE CREW · SIGNAL DESK</h1>
+    <h1>THE CREW · SIGNAL DESK <span class="mono" id="ver" style="font-size:12px;opacity:.6;vertical-align:middle">v?</span></h1>
     <div class="tag">Four AI agents. One desk. Full consensus or no trade · <span class="mono">15m / 1h / 4h / 1d</span> confluence · crypto + FX + gold · self-audited record</div>
   </div>
   <div style="display:flex;align-items:center;gap:14px">
@@ -1485,6 +1487,7 @@ function render(d){
   document.getElementById('s-open').textContent = opens;
   document.getElementById('s-open-n').textContent = opens ? d.open_signals.map(s=>s.symbol.replace('USDT','')).join(', ') : 'none right now';
   document.getElementById('s-cycles').textContent = d.cycles;
+  const ver=document.getElementById('ver'); if (ver && d.version) ver.textContent = 'v'+d.version;
   document.getElementById('s-cycle-n').textContent = `every ${d.cycle_minutes} min`;
 
   // agents

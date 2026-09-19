@@ -186,3 +186,9 @@ Fixed by dropping the blocking `with` and calling `ex.shutdown(wait=False)`
 in a `finally`, so a hung fetch is abandoned (leaked, dies on its own later)
 instead of blocking the caller. Verified with a simulated 60s hang: fetch now
 returns in the intended 20s instead of blocking the full 60s.
+
+## Version marker (v1.8.3)
+
+The dashboard title now shows the running version (e.g. "v1.8.3") and
+/api/status exposes `"version"`. Check what's live at a glance — no more
+guessing which zip is deployed. Override with the APP_VERSION env var.
